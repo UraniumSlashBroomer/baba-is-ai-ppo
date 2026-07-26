@@ -33,12 +33,15 @@ def load_config(path):
                 value = value.lower() == "true"
             else:
                 try:
-                    value = int(value)
+                    value = json.loads(value)
                 except ValueError:
                     try:
-                        value = float(value)
+                        value = int(value)
                     except ValueError:
-                        value = value.strip("\"'")
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            value = value.strip("\"'")
             cfg[key.strip()] = value
         return cfg
 
@@ -49,6 +52,33 @@ def make_env(cfg):
     env = baba.make(cfg["env_id"])
     env.max_steps = cfg["max_episode_steps"]
     return env
+
+
+def env_ids_from_config(cfg):
+    env_ids = cfg.get("env_ids")
+    if env_ids is None:
+        env_ids = cfg.get("train_env_ids")
+    if env_ids is None:
+        return [cfg["env_id"]]
+    if isinstance(env_ids, str):
+        return [env_ids]
+    return list(env_ids)
+
+
+def make_single_env(env_id, cfg):
+    import baba
+
+    env = baba.make(env_id)
+    env.max_steps = cfg["max_episode_steps"]
+    return env
+
+
+def make_train_env(cfg, warmup_episodes=0):
+    env_ids = env_ids_from_config(cfg)
+    if len(env_ids) == 1:
+        env = make_single_env(env_ids[0], cfg)
+        return ShapedBabaEnv(env, cfg, warmup_episodes=warmup_episodes)
+    return MultiTaskBabaEnv(env_ids, cfg, warmup_episodes=warmup_episodes)
 
 
 def set_seed(seed):
@@ -66,6 +96,26 @@ def render_live_step(env, render_fps):
     if render_fps <= 0:
         return
     start = time.perf_counter()
+    env.render(mode="human")
+    delay = (1.0 / render_fps) - (time.perf_counter() - start)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def action_name(env, action):
+    try:
+        return env.actions(action).name
+    except ValueError:
+        return str(action)
+
+
+def render_validation_step(env, render_fps, env_action, timestep):
+    if render_fps <= 0:
+        return
+    start = time.perf_counter()
+    if getattr(env, "window", None) is None:
+        env.render(mode="human")
+    env.window.set_caption(f"action={action_name(env, env_action)} ({env_action}) | timestep={timestep}")
     env.render(mode="human")
     delay = (1.0 / render_fps) - (time.perf_counter() - start)
     if delay > 0:
@@ -326,6 +376,52 @@ class ShapedBabaEnv:
         return 0 <= x < self.env.width and 0 <= y < self.env.height
 
 
+class MultiTaskBabaEnv:
+    def __init__(self, env_ids, cfg, warmup_episodes=0):
+        self.env_ids = list(env_ids)
+        self.cfg = cfg
+        self.envs = [
+            ShapedBabaEnv(make_single_env(env_id, cfg), cfg, warmup_episodes=warmup_episodes)
+            for env_id in self.env_ids
+        ]
+        self.current_idx = 0
+        self.current_env = self.envs[0]
+        self._validate_env_compatibility()
+
+    def __getattr__(self, name):
+        return getattr(self.current_env, name)
+
+    def _validate_env_compatibility(self):
+        obs_shape = self.envs[0].observation_space.shape
+        action_n = self.envs[0].action_space.n
+        for env_id, env in zip(self.env_ids[1:], self.envs[1:]):
+            if env.observation_space.shape != obs_shape:
+                raise ValueError(
+                    f"All train envs must have the same observation shape. "
+                    f"{env_id} has {env.observation_space.shape}, expected {obs_shape}."
+                )
+            if env.action_space.n != action_n:
+                raise ValueError(
+                    f"All train envs must have the same action count. "
+                    f"{env_id} has {env.action_space.n}, expected {action_n}."
+                )
+
+    @property
+    def active_env_id(self):
+        return self.env_ids[self.current_idx]
+
+    def reset(self):
+        self.current_idx = int(np.random.randint(len(self.envs)))
+        self.current_env = self.envs[self.current_idx]
+        return self.current_env.reset()
+
+    def step(self, action):
+        obs, reward, done, info = self.current_env.step(action)
+        info = dict(info)
+        info["env_id"] = self.active_env_id
+        return obs, reward, done, info
+
+
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, n_actions, hidden_size):
         super().__init__()
@@ -373,6 +469,58 @@ class ActorCritic(nn.Module):
 
     def evaluate(self, obs, actions):
         logits, value = self(obs)
+        dist = Categorical(logits=logits)
+        return dist.log_prob(actions), dist.entropy(), value
+
+
+class RecurrentActorCritic(nn.Module):
+    def __init__(self, obs_shape, n_actions, hidden_size):
+        super().__init__()
+        in_channels = obs_shape[-1]
+        self.feature_net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_channels, obs_shape[0], obs_shape[1])
+            feature_dim = self.feature_net(dummy).shape[1]
+
+        self.actor_lstm = nn.LSTMCell(feature_dim, hidden_size)
+        self.critic_lstm = nn.LSTMCell(feature_dim, hidden_size)
+        self.actor_head = nn.Linear(hidden_size, n_actions)
+        self.critic_head = nn.Linear(hidden_size, 1)
+        self.hidden_size = hidden_size
+
+    def initial_state(self, batch_size, device):
+        shape = (batch_size, self.hidden_size)
+        return (
+            torch.zeros(shape, device=device),
+            torch.zeros(shape, device=device),
+            torch.zeros(shape, device=device),
+            torch.zeros(shape, device=device),
+        )
+
+    def forward(self, x, state):
+        x = x.permute(0, 3, 1, 2)
+        features = self.feature_net(x)
+        actor_h, actor_c, critic_h, critic_c = state
+        actor_h, actor_c = self.actor_lstm(features, (actor_h, actor_c))
+        critic_h, critic_c = self.critic_lstm(features, (critic_h, critic_c))
+        logits = self.actor_head(actor_h)
+        value = self.critic_head(critic_h).squeeze(-1)
+        return logits, value, (actor_h, actor_c, critic_h, critic_c)
+
+    def act(self, obs, state):
+        logits, value, next_state = self(obs, state)
+        dist = Categorical(logits=logits)
+        action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), value, next_state
+
+    def evaluate(self, obs, actions, states):
+        logits, value, _ = self(obs, states)
         dist = Categorical(logits=logits)
         return dist.log_prob(actions), dist.entropy(), value
 
@@ -438,13 +586,18 @@ class SharedActorCritic(nn.Module):
         return action, dist.log_prob(action), dist.entropy(), value
 
 
-def save_checkpoint(model, optimizer, cfg, path):
+def save_checkpoint(model, optimizer, cfg, path, stats=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": cfg,
+        "stats": stats,
     }, path)
+    if stats is not None:
+        metadata_path = path.with_suffix(".json")
+        with metadata_path.open("w") as f:
+            json.dump({"checkpoint": str(path), "config": cfg, "stats": stats}, f, indent=2)
 
 
 def load_checkpoint(model, path, device):
@@ -456,7 +609,12 @@ def load_checkpoint(model, path, device):
 def load_model_for_checkpoint(env, cfg, checkpoint, device):
     ckpt = torch.load(checkpoint, map_location=device)
     state = ckpt["model"]
-    if "actor_cnn.0.weight" in state:
+    if "actor_lstm.weight_ih" in state:
+        n_actions = state["actor_head.weight"].shape[0]
+        hidden_size = state["actor_head.weight"].shape[1]
+        model_cls = RecurrentActorCritic
+        cfg["model_type"] = "lstm"
+    elif "actor_cnn.0.weight" in state:
         n_actions = state["actor_head.weight"].shape[0]
         hidden_size = state["actor_head.weight"].shape[1]
         model_cls = ActorCritic
@@ -479,14 +637,50 @@ def load_model_for_checkpoint(env, cfg, checkpoint, device):
     return model
 
 
+def build_model(obs_shape, n_actions, cfg):
+    model_type = cfg.get("model_type", "cnn")
+    if model_type == "cnn":
+        return ActorCritic(obs_shape, n_actions, cfg["hidden_size"])
+    if model_type == "lstm":
+        return RecurrentActorCritic(obs_shape, n_actions, cfg["hidden_size"])
+    raise ValueError(f"Unknown model_type={model_type!r}. Expected 'cnn' or 'lstm'.")
+
+
+def is_recurrent_model(model):
+    return isinstance(model, RecurrentActorCritic)
+
+
+def detach_state(state):
+    return tuple(x.detach() for x in state)
+
+
+def state_to_numpy(state):
+    return tuple(x.detach().cpu().numpy() for x in state)
+
+
+def numpy_to_state(states, device):
+    if not states:
+        return None
+    stacked = []
+    for state_idx in range(len(states[0])):
+        stacked.append(np.concatenate([state[state_idx] for state in states], axis=0))
+    return tuple(torch.tensor(x, dtype=torch.float32, device=device) for x in stacked)
+
+
 def rollout(env, model, cfg, device, render_fps=0):
+    rollout_start = time.perf_counter()
     obs = env.reset()
     obs_buf, action_buf, logprob_buf = [], [], []
     reward_buf, done_buf, value_buf = [], [], []
+    recurrent_state_buf = []
+    recurrent = is_recurrent_model(model)
+    recurrent_state = model.initial_state(1, device) if recurrent else None
     episode_returns = []
     episode_successes = []
     episode_lengths = []
     episode_env_returns = []
+    episode_env_ids = []
+    env_episode_counts = {}
     episode_return = 0
     episode_env_return = 0
     episode_length = 0
@@ -498,7 +692,11 @@ def rollout(env, model, cfg, device, render_fps=0):
     for _ in range(cfg["rollout_steps"]):
         obs_t = obs_to_tensor(obs, device)
         with torch.no_grad():
-            action, logprob, _, value = model.act(obs_t)
+            if recurrent:
+                recurrent_state_buf.append(state_to_numpy(recurrent_state))
+                action, logprob, _, value, next_recurrent_state = model.act(obs_t, recurrent_state)
+            else:
+                action, logprob, _, value = model.act(obs_t)
 
         env_action = to_env_action(action.item(), cfg)
         next_obs, reward, done, info = env.step(env_action)
@@ -519,18 +717,28 @@ def rollout(env, model, cfg, device, render_fps=0):
         stuck_pushes += int(info.get("stuck_push", False))
         rule_dead_events += int(info.get("rule_dead", False))
         obs = next_obs
+        if recurrent:
+            recurrent_state = detach_state(next_recurrent_state)
         if done:
+            env_id = info.get("env_id", getattr(env, "active_env_id", cfg.get("env_id", "unknown")))
             episode_returns.append(episode_return)
             episode_env_returns.append(episode_env_return)
             episode_successes.append(episode_env_return > 0)
             episode_lengths.append(episode_length)
+            episode_env_ids.append(env_id)
+            env_episode_counts[env_id] = env_episode_counts.get(env_id, 0) + 1
             episode_return = 0
             episode_env_return = 0
             episode_length = 0
             obs = env.reset()
+            if recurrent:
+                recurrent_state = model.initial_state(1, device)
 
     with torch.no_grad():
-        next_value = model(obs_to_tensor(obs, device))[1].item()
+        if recurrent:
+            next_value = model(obs_to_tensor(obs, device), recurrent_state)[1].item()
+        else:
+            next_value = model(obs_to_tensor(obs, device))[1].item()
 
     rewards = np.array(reward_buf, dtype=np.float32)
     dones = np.array(done_buf, dtype=np.float32)
@@ -552,39 +760,48 @@ def rollout(env, model, cfg, device, render_fps=0):
         "logprobs": np.array(logprob_buf, dtype=np.float32),
         "advantages": advantages,
         "returns": returns,
+        "recurrent_states": recurrent_state_buf,
         "episode_returns": episode_returns,
         "episode_env_returns": episode_env_returns,
         "episode_successes": episode_successes,
         "episode_lengths": episode_lengths,
+        "episode_env_ids": episode_env_ids,
+        "env_episode_counts": env_episode_counts,
         "rule_assemblies": rule_assemblies,
         "boundary_hits": boundary_hits,
         "stuck_pushes": stuck_pushes,
         "rule_dead_events": rule_dead_events,
+        "rollout_time_sec": time.perf_counter() - rollout_start,
     }
 
 
 def train(cfg, render_fps=0):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
-    env = make_env(cfg)
     warmup_ratio = cfg.get("warmup_episode_ratio", 0)
     estimated_episodes = max(1, cfg["total_steps"] // cfg["max_episode_steps"])
     warmup_episodes = int(estimated_episodes * warmup_ratio)
-    env = ShapedBabaEnv(env, cfg, warmup_episodes=warmup_episodes)
+    env = make_train_env(cfg, warmup_episodes=warmup_episodes)
     obs_shape = env.observation_space.shape
     n_actions = policy_action_count(env, cfg)
 
-    model = ActorCritic(obs_shape, n_actions, cfg["hidden_size"]).to(device)
+    model = build_model(obs_shape, n_actions, cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"])
+    recurrent = is_recurrent_model(model)
 
     run_dir = ROOT / "ppo" / "checkpoints" / cfg["name"]
     log_dir = ROOT / "ppo" / "logs" / cfg["name"]
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "train.jsonl"
     n_updates = cfg["total_steps"] // cfg["rollout_steps"]
+    save_every_enabled = bool(cfg.get("save_every", False))
+    save_every_n_steps = int(cfg.get("save_every_n_steps", 0))
+    next_save_step = save_every_n_steps if save_every_enabled and save_every_n_steps > 0 else None
 
     for update in range(1, n_updates + 1):
+        iteration_start = time.perf_counter()
         batch = rollout(env, model, cfg, device, render_fps=render_fps)
+        rollout_time = batch["rollout_time_sec"]
 
         obs = torch.tensor(batch["obs"], dtype=torch.float32, device=device) / 255.0
         actions = torch.tensor(batch["actions"], dtype=torch.long, device=device)
@@ -592,14 +809,20 @@ def train(cfg, render_fps=0):
         advantages = torch.tensor(batch["advantages"], dtype=torch.float32, device=device)
         returns = torch.tensor(batch["returns"], dtype=torch.float32, device=device)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        recurrent_states = numpy_to_state(batch["recurrent_states"], device) if recurrent else None
 
         indices = np.arange(cfg["rollout_steps"])
         policy_losses, value_losses, entropy_losses = [], [], []
+        update_start = time.perf_counter()
         for _ in range(cfg["update_epochs"]):
             np.random.shuffle(indices)
             for start in range(0, len(indices), cfg["minibatch_size"]):
                 mb = indices[start:start + cfg["minibatch_size"]]
-                new_logprobs, entropy, values = model.evaluate(obs[mb], actions[mb])
+                if recurrent:
+                    mb_states = tuple(x[mb] for x in recurrent_states)
+                    new_logprobs, entropy, values = model.evaluate(obs[mb], actions[mb], mb_states)
+                else:
+                    new_logprobs, entropy, values = model.evaluate(obs[mb], actions[mb])
                 ratio = (new_logprobs - old_logprobs[mb]).exp()
 
                 pg_loss1 = -advantages[mb] * ratio
@@ -616,6 +839,8 @@ def train(cfg, render_fps=0):
                 policy_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
+        update_time = time.perf_counter() - update_start
+        iteration_time = time.perf_counter() - iteration_start
 
         avg_return = np.mean(batch["episode_returns"]) if batch["episode_returns"] else 0
         avg_env_return = np.mean(batch["episode_env_returns"]) if batch["episode_env_returns"] else 0
@@ -635,6 +860,12 @@ def train(cfg, render_fps=0):
             "policy_loss": float(np.mean(policy_losses)),
             "value_loss": float(np.mean(value_losses)),
             "entropy": float(np.mean(entropy_losses)),
+            "rollout_time_sec": float(rollout_time),
+            "update_time_sec": float(update_time),
+            "iteration_time_sec": float(iteration_time),
+            "seconds_per_step": float(iteration_time / cfg["rollout_steps"]),
+            "steps_per_second": float(cfg["rollout_steps"] / iteration_time) if iteration_time > 0 else 0.0,
+            "env_episode_counts": batch["env_episode_counts"],
         }
         with log_path.open("a") as f:
             f.write(json.dumps(stats) + "\n")
@@ -643,20 +874,32 @@ def train(cfg, render_fps=0):
             f"shaped_return={avg_return:.3f} env_return={avg_env_return:.3f} "
             f"success_rate={success_rate:.3f} avg_len={avg_length:.1f} "
             f"rules={batch['rule_assemblies']} boundary_hits={batch['boundary_hits']} "
-            f"stuck_pushes={batch['stuck_pushes']} dead_rules={batch['rule_dead_events']}"
+            f"stuck_pushes={batch['stuck_pushes']} dead_rules={batch['rule_dead_events']} "
+            f"iter_time={iteration_time:.2f}s rollout_time={rollout_time:.2f}s "
+            f"update_time={update_time:.2f}s steps_per_sec={stats['steps_per_second']:.1f}"
         )
 
         if update % cfg["checkpoint_every"] == 0 or update == n_updates:
-            save_checkpoint(model, optimizer, cfg, run_dir / f"ppo_{update:04d}.pt")
-            save_checkpoint(model, optimizer, cfg, run_dir / "latest.pt")
+            save_checkpoint(model, optimizer, cfg, run_dir / f"ppo_{update:04d}.pt", stats=stats)
+            save_checkpoint(model, optimizer, cfg, run_dir / "latest.pt", stats=stats)
+        if next_save_step is not None and stats["steps"] >= next_save_step:
+            step_path = run_dir / f"ppo_steps_{stats['steps']:08d}.pt"
+            save_checkpoint(model, optimizer, cfg, step_path, stats=stats)
+            save_checkpoint(model, optimizer, cfg, run_dir / "latest_step.pt", stats=stats)
+            while next_save_step <= stats["steps"]:
+                next_save_step += save_every_n_steps
 
 
 def val(cfg, checkpoint, visualize=False, render_fps=0):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
-    env = make_env(cfg)
+    eval_env_id = cfg.get("eval_env_id", cfg["env_id"])
+    env_cfg = dict(cfg)
+    env_cfg["env_id"] = eval_env_id
+    env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)
     model.eval()
+    recurrent = is_recurrent_model(model)
 
     successes = 0
     returns = []
@@ -664,14 +907,22 @@ def val(cfg, checkpoint, visualize=False, render_fps=0):
         obs = env.reset()
         done = False
         total_reward = 0
+        timestep = 0
+        recurrent_state = model.initial_state(1, device) if recurrent else None
         while not done:
             with torch.no_grad():
-                logits, _ = model(obs_to_tensor(obs, device))
+                if recurrent:
+                    logits, _, recurrent_state = model(obs_to_tensor(obs, device), recurrent_state)
+                    recurrent_state = detach_state(recurrent_state)
+                else:
+                    logits, _ = model(obs_to_tensor(obs, device))
                 policy_action = torch.argmax(logits, dim=-1).item()
-            obs, reward, done, _ = env.step(to_env_action(policy_action, cfg))
+            env_action = to_env_action(policy_action, cfg)
+            obs, reward, done, _ = env.step(env_action)
+            timestep += 1
             total_reward += reward
             if visualize:
-                render_live_step(env, render_fps or cfg.get("eval_render_fps", 30))
+                render_validation_step(env, render_fps or cfg.get("eval_render_fps", 30), env_action, timestep)
         successes += total_reward > 0
         returns.append(total_reward)
         print(f"episode={ep + 1} return={total_reward:.3f}")
@@ -682,9 +933,13 @@ def val(cfg, checkpoint, visualize=False, render_fps=0):
 def sample(cfg, checkpoint, visualize=False):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
-    env = make_env(cfg)
+    sample_env_id = cfg.get("sample_env_id", cfg.get("eval_env_id", cfg["env_id"]))
+    env_cfg = dict(cfg)
+    env_cfg["env_id"] = sample_env_id
+    env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)
     model.eval()
+    recurrent = is_recurrent_model(model)
 
     out_dir = ROOT / "samples" / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -693,11 +948,16 @@ def sample(cfg, checkpoint, visualize=False):
         obs = env.reset()
         frames, observations, actions, rewards, dones = [], [], [], [], []
         done = False
+        recurrent_state = model.initial_state(1, device) if recurrent else None
         while not done:
             if visualize:
                 frames.append(env.render(mode="rgb_array"))
             with torch.no_grad():
-                action, _, _, _ = model.act(obs_to_tensor(obs, device))
+                if recurrent:
+                    action, _, _, _, recurrent_state = model.act(obs_to_tensor(obs, device), recurrent_state)
+                    recurrent_state = detach_state(recurrent_state)
+                else:
+                    action, _, _, _ = model.act(obs_to_tensor(obs, device))
             env_action = to_env_action(action.item(), cfg)
             next_obs, reward, done, _ = env.step(env_action)
 
@@ -755,7 +1015,7 @@ def main():
         render_fps = args.render_fps or (cfg.get("train_render_fps", 0) if args.visualize else 0)
         train(cfg, render_fps=render_fps)
     elif args.mode == "val":
-        val(cfg, checkpoint, visualize=args.visualize, render_fps=args.render_fps)
+        val(cfg, checkpoint, visualize=args.visualize or args.render_fps > 0, render_fps=args.render_fps)
     elif args.mode == "sample":
         sample(cfg, checkpoint, visualize=args.visualize)
 
