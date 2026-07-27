@@ -11,8 +11,13 @@ def parse_args():
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--render-fps", type=float, default=0)
+    parser.add_argument("--greedy", action="store_true", help="Use argmax policy actions for val/sample.")
+    parser.add_argument("--no-greedy", action="store_true", help="Sample policy actions for val/sample.")
     parser.add_argument("--override", default=None)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.greedy and args.no_greedy:
+        parser.error("--greedy and --no-greedy are mutually exclusive")
+    return args
 
 
 def main():
@@ -20,6 +25,11 @@ def main():
     cfg = load_config(args.config)
     if args.override:
         cfg.update(json.loads(args.override))
+    policy_greedy = None
+    if args.greedy:
+        policy_greedy = True
+    elif args.no_greedy:
+        policy_greedy = False
 
     checkpoint = args.checkpoint
     if checkpoint is None and args.mode in {"val", "sample"}:
@@ -35,7 +45,7 @@ def main():
     elif args.mode == "val":
         from evaluate import val
 
-        val(cfg, checkpoint, args.visualize or args.render_fps > 0, args.render_fps)
+        val(cfg, checkpoint, args.visualize or args.render_fps > 0, args.render_fps, policy_greedy)
     elif args.mode == "test":
         from manual_test import test_reward_manually
 
@@ -43,7 +53,7 @@ def main():
     else:
         from evaluate import sample
 
-        sample(cfg, checkpoint, args.visualize)
+        sample(cfg, checkpoint, args.visualize, policy_greedy)
 
 
 if __name__ == "__main__":

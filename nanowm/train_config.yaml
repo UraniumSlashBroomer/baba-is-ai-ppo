@@ -1,0 +1,92 @@
+seed: 3407
+device: auto
+output_dir: nanowm/runs/baba_nanowm_s
+
+data:
+  samples_root: samples/make_win
+  split_ratio: 0.9
+  num_workers: 4
+  action_dim: 4
+  action_offset: -1
+  action_encoding: one_hot
+  slice_mode: exhaustive
+  stride: 1
+  resize_mode: stretch
+
+model:
+  arch: NanoWM-S/2
+  name: baba-nanowm-s2-128
+  image_size: 128
+  latent_size: 16
+  latent_channels: 4
+  num_frames: 2
+  n_context_frames: 1
+  use_action: true
+  action_injection:
+    type: additive
+  causal: true
+  extras: 1
+  num_classes: 1000
+
+latent_codec:
+  kind: sd_vae
+  model_path: ${oc.env:VAE_MODEL_PATH,stabilityai/sd-vae-ft-mse}
+  latent_channels: ${model.latent_channels}
+  precision: fp32
+
+dataset:
+  frame_interval: 1
+  spec:
+    action_dim: ${data.action_dim}
+
+diffusion:
+  noise_schedule: squaredcos_cap_v2
+  diffusion_steps: 1000
+  pred_name: v
+  mode: diffusion_forcing
+  snr_gamma: 5.0
+  zero_terminal_snr: true
+  timestep_sampling: logit_normal
+  logit_normal_mean: 0.0
+  logit_normal_std: 1.0
+
+train:
+  batch_size: 16
+  max_steps: 100000
+  lr: 1e-4
+  action_lr: 1e-4
+  weight_decay: 0.01
+  grad_clip_norm: 0.1
+  gradient_accumulation: 1
+  mixed_precision: true
+  compile: false
+  log_every: 50
+  val_every: 1000
+  save_every: 1000
+  keep_last_checkpoints: 3
+  target_frames: next_only
+  action_loss_weight: 1.0
+
+action_head:
+  hidden_size: 256
+
+validation:
+  env_id: env/make_win
+  episodes: 20
+  max_episode_steps: 128
+  use_idle: false
+  greedy: true
+  sample_next_image: true
+  scheduling_mode: full_sequence
+  num_sampling_steps: 10
+
+wandb:
+  enabled: true
+  project: baba-nanowm
+  entity: ${oc.env:WANDB_ENTITY,null}
+  mode: ${oc.env:WANDB_MODE,online}
+  name: ${model.name}
+
+experiment:
+  infra:
+    vae_precision: ${latent_codec.precision}

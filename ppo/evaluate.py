@@ -26,11 +26,13 @@ def _policy_step(model, obs, cfg, device, recurrent_state=None, greedy=False):
     return to_env_action(action.item(), cfg), recurrent_state
 
 
-def val(cfg, checkpoint, visualize=False, render_fps=0):
+def val(cfg, checkpoint, visualize=False, render_fps=0, greedy=None):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
     if checkpoint:
         cfg.update(checkpoint_architecture(checkpoint, device))
+    if greedy is None:
+        greedy = cfg.get("eval_greedy", True)
     env_cfg = dict(cfg, env_id=cfg.get("eval_env_id", cfg["env_id"]))
     env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)
@@ -44,7 +46,7 @@ def val(cfg, checkpoint, visualize=False, render_fps=0):
         timestep = 0
         recurrent_state = model.initial_state(1, device) if is_recurrent_model(model) else None
         while not done:
-            env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state, greedy=True)
+            env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state, greedy=greedy)
             obs, reward, done, _ = env.step(env_action)
             timestep += 1
             total_reward += reward
@@ -64,11 +66,13 @@ def val(cfg, checkpoint, visualize=False, render_fps=0):
     print(f"success_rate={successes / cfg['eval_episodes']:.3f} avg_return={np.mean(returns):.3f}")
 
 
-def sample(cfg, checkpoint, visualize=False):
+def sample(cfg, checkpoint, visualize=False, greedy=None):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
     if checkpoint:
         cfg.update(checkpoint_architecture(checkpoint, device))
+    if greedy is None:
+        greedy = cfg.get("sample_greedy", False)
     env_cfg = dict(cfg, env_id=cfg.get("sample_env_id", cfg.get("eval_env_id", cfg["env_id"])))
     env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)
@@ -79,31 +83,23 @@ def sample(cfg, checkpoint, visualize=False):
 
     for ep in range(cfg["sample_episodes"]):
         obs = env.reset()
-        frames, observations, actions, rewards, dones = [], [], [], [], []
+        frames, actions, rewards = [env.render(mode="rgb_array")], [], []
         done = False
         recurrent_state = model.initial_state(1, device) if is_recurrent_model(model) else None
         while not done:
-            if visualize:
-                frames.append(env.render(mode="rgb_array"))
-            env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state)
+            env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state, greedy=greedy)
             next_obs, reward, done, _ = env.step(env_action)
 
-            observations.append(obs)
             actions.append(env_action)
             rewards.append(reward)
-            dones.append(done)
+            frames.append(env.render(mode="rgb_array"))
             obs = next_obs
 
-            if done and visualize:
-                frames.append(env.render(mode="rgb_array"))
+        episode_dir = out_dir / f"episode_{ep:04d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        np.save(episode_dir / "frames.npy", np.asarray(frames, dtype=np.uint8))
+        np.save(episode_dir / "actions.npy", np.asarray(actions))
 
-        np.savez_compressed(
-            out_dir / f"episode_{ep:04d}.npz",
-            observations=np.array(observations),
-            actions=np.array(actions),
-            rewards=np.array(rewards, dtype=np.float32),
-            dones=np.array(dones),
-        )
         if visualize and frames:
             video_path = out_dir / f"episode_{ep:04d}.mp4"
             h, w = frames[0].shape[:2]
