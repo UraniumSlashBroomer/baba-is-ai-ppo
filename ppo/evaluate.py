@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import torch
 
-from checkpoints import load_model_for_checkpoint
+from checkpoints import checkpoint_architecture, load_model_for_checkpoint
 from env import make_env, to_env_action
 from models import detach_state, is_recurrent_model
 from paths import ROOT
@@ -29,6 +29,8 @@ def _policy_step(model, obs, cfg, device, recurrent_state=None, greedy=False):
 def val(cfg, checkpoint, visualize=False, render_fps=0):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
+    if checkpoint:
+        cfg.update(checkpoint_architecture(checkpoint, device))
     env_cfg = dict(cfg, env_id=cfg.get("eval_env_id", cfg["env_id"]))
     env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)
@@ -65,6 +67,8 @@ def val(cfg, checkpoint, visualize=False, render_fps=0):
 def sample(cfg, checkpoint, visualize=False):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
+    if checkpoint:
+        cfg.update(checkpoint_architecture(checkpoint, device))
     env_cfg = dict(cfg, env_id=cfg.get("sample_env_id", cfg.get("eval_env_id", cfg["env_id"])))
     env = make_env(env_cfg)
     model = load_model_for_checkpoint(env, cfg, checkpoint, device)

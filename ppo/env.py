@@ -151,9 +151,11 @@ class ShapedBabaEnv:
         if rule_dead:
             self.rule_dead_penalty_given = True
 
+        if self.cfg.get("use_stuck_push_penalty", True):
+            reward += stuck_push * self.cfg.get("stuck_push_penalty", 0)
+
         if shaped:
             reward += hit_boundary * self.cfg.get("boundary_penalty", 0)
-            reward += stuck_push * self.cfg.get("stuck_push_penalty", 0)
             reward += rule_dead * self.cfg.get("rule_dead_penalty", 0)
 
         self.episode_return += reward

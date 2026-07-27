@@ -32,6 +32,7 @@ use_idle: false
 use_coord_channels: true
 use_shaped_reward: false
 boundary_penalty: -0.01
+use_stuck_push_penalty: true
 stuck_push_penalty: -0.01
 rule_assembly_reward: 0.3
 rule_dead_penalty: -0.5
