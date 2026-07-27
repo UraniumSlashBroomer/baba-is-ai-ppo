@@ -31,7 +31,7 @@ def main():
         from train import train
 
         render_fps = args.render_fps or (cfg.get("train_render_fps", 0) if args.visualize else 0)
-        train(cfg, render_fps)
+        train(cfg, render_fps, args.checkpoint)
     elif args.mode == "val":
         from evaluate import val
 

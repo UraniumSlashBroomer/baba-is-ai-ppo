@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from checkpoints import save_checkpoint
+from checkpoints import checkpoint_architecture, load_training_checkpoint, save_checkpoint
 from env import make_train_env, policy_action_count
 from models import build_model, is_recurrent_model, numpy_to_state
 from paths import ROOT
@@ -33,9 +33,39 @@ def _save_periodic(model, optimizer, cfg, run_dir, update, n_updates, steps, sta
     return next_save_step
 
 
-def train(cfg, render_fps=0):
+def _latest_jsonl_stats(path):
+    if not path.exists():
+        return {}
+    last = None
+    with path.open() as f:
+        for line in f:
+            if line.strip():
+                last = line
+    return json.loads(last) if last else {}
+
+
+def _resume_offsets(ckpt, checkpoint):
+    stats = ckpt.get("stats") or {}
+    if not stats and checkpoint is not None:
+        checkpoint = ROOT / checkpoint
+        summary = checkpoint.with_name("latest_summary.json")
+        if summary.exists():
+            stats = json.loads(summary.read_text()).get("latest_train_log_stats") or {}
+    if not stats and checkpoint is not None:
+        run_name = checkpoint.parent.name
+        stats = _latest_jsonl_stats(ROOT / "ppo" / "logs" / run_name / "train.jsonl")
+    return int(stats.get("update", 0)), int(stats.get("steps", 0))
+
+
+def train(cfg, render_fps=0, checkpoint=None):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
+    if checkpoint is None:
+        checkpoint = cfg.get("resume_from_checkpoint")
+    if checkpoint:
+        arch = checkpoint_architecture(checkpoint, device)
+        cfg.update(arch)
+        print(f"checkpoint_architecture={arch}")
     warmup_episodes = int(
         max(1, cfg["total_steps"] // cfg["max_episode_steps"])
         * cfg.get("warmup_episode_ratio", 0)
@@ -43,6 +73,11 @@ def train(cfg, render_fps=0):
     env = make_train_env(cfg, warmup_episodes)
     model = build_model(env.observation_space.shape, policy_action_count(env, cfg), cfg).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["learning_rate"])
+    update_offset = step_offset = 0
+    if checkpoint:
+        ckpt = load_training_checkpoint(model, optimizer, checkpoint, device)
+        update_offset, step_offset = _resume_offsets(ckpt, checkpoint)
+        print(f"resumed checkpoint={checkpoint} update={update_offset} steps={step_offset}")
     recurrent = is_recurrent_model(model)
 
     run_dir = ROOT / "ppo" / "checkpoints" / cfg["name"]
@@ -100,9 +135,10 @@ def train(cfg, render_fps=0):
 
         update_time = time.perf_counter() - update_start
         iteration_time = time.perf_counter() - iteration_start
-        steps = update * cfg["rollout_steps"]
+        global_update = update_offset + update
+        steps = step_offset + update * cfg["rollout_steps"]
         stats = {
-            "update": update,
+            "update": global_update,
             "steps": steps,
             "avg_shaped_return": _mean(batch["episode_returns"]),
             "avg_env_return": _mean(batch["episode_env_returns"]),
@@ -127,7 +163,7 @@ def train(cfg, render_fps=0):
             f.write(json.dumps(stats) + "\n")
 
         print(
-            f"update={update}/{n_updates} steps={steps} "
+            f"update={global_update}/{update_offset + n_updates} steps={steps} "
             f"shaped_return={stats['avg_shaped_return']:.3f} env_return={stats['avg_env_return']:.3f} "
             f"success_rate={stats['success_rate']:.3f} avg_len={stats['avg_episode_length']:.1f} "
             f"rules={stats['rule_assemblies']} boundary_hits={stats['boundary_hits']} "
@@ -137,5 +173,5 @@ def train(cfg, render_fps=0):
         )
 
         next_save_step = _save_periodic(
-            model, optimizer, cfg, run_dir, update, n_updates, steps, stats, next_save_step
+            model, optimizer, cfg, run_dir, global_update, update_offset + n_updates, steps, stats, next_save_step
         )

@@ -110,6 +110,7 @@ class ShapedBabaEnv:
         self.cfg = cfg
         self.warmup_episodes = warmup_episodes
         self.episode_idx = 0
+        self.episode_return = 0.0
         self.rule_reward_given = False
         self.rule_dead_penalty_given = False
         self.observation_space = coord_observation_space(env.observation_space, cfg)
@@ -121,6 +122,7 @@ class ShapedBabaEnv:
         if self.episode_idx < self.warmup_episodes:
             np.random.seed(self.cfg.get("warmup_seed", self.cfg["seed"]))
         obs = self.env.reset()
+        self.episode_return = 0.0
         self.rule_reward_given = self._is_win_rule_active()
         self.rule_dead_penalty_given = False
         self.episode_idx += 1
@@ -130,7 +132,8 @@ class ShapedBabaEnv:
         hit_boundary = self._hits_boundary(action)
         pushed_before = self._pushed_block_before(action)
         obs, env_reward, done, info = self.env.step(action)
-        reward = env_reward
+        win_bonus = 1.0 if env_reward > 0 else 0.0
+        reward = win_bonus - (1.0 / self.cfg["max_episode_steps"])
         stuck_push = self._is_stuck_push(pushed_before)
         shaped = self.cfg.get("use_shaped_reward", True)
 
@@ -153,9 +156,12 @@ class ShapedBabaEnv:
             reward += stuck_push * self.cfg.get("stuck_push_penalty", 0)
             reward += rule_dead * self.cfg.get("rule_dead_penalty", 0)
 
+        self.episode_return += reward
         info = dict(info)
         info.update(
             env_reward=env_reward,
+            env_success=env_reward > 0,
+            episode_return=self.episode_return if done else None,
             rule_assembled=rule_assembled,
             hit_boundary=hit_boundary,
             stuck_push=stuck_push,
