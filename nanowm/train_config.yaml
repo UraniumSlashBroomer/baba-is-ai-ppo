@@ -6,6 +6,11 @@ data:
   samples_root: samples/make_win
   train_samples_root: null
   val_samples_root: null
+  random_train_samples_root: null
+  random_fraction: 0.0
+  mixed_total_episodes: null
+  random_action_loss_weight: 0.0
+  ppo_action_loss_weight: 1.0
   split_ratio: 0.9
   num_workers: 4
   action_dim: 4

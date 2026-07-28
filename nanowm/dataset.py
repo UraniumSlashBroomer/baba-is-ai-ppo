@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 
 ResizeMode = Literal["stretch", "pad"]
@@ -78,6 +78,10 @@ class BabaSamplesNanoWMDataset(Dataset):
         split: Literal["train", "val", "all"] = "all",
         split_ratio: float = 0.9,
         random_seed: int = 42,
+        episode_limit: Optional[int] = None,
+        source: str = "ppo",
+        wm_loss_weight: float = 1.0,
+        action_loss_weight: float = 1.0,
         slice_mode: SliceMode = "exhaustive",
         stride: int = 1,
         resize_mode: ResizeMode = "stretch",
@@ -104,6 +108,10 @@ class BabaSamplesNanoWMDataset(Dataset):
         self.split = split
         self.split_ratio = float(split_ratio)
         self.random_seed = int(random_seed)
+        self.episode_limit = None if episode_limit is None else int(episode_limit)
+        self.source = str(source)
+        self.wm_loss_weight = float(wm_loss_weight)
+        self.action_loss_weight = float(action_loss_weight)
         self.slice_mode = slice_mode
         self.stride = int(stride)
         self.resize_mode = resize_mode
@@ -112,6 +120,7 @@ class BabaSamplesNanoWMDataset(Dataset):
 
         self.episodes = self._discover_episodes(self.root)
         self.episode_indices = self._split_episode_indices()
+        self.episode_indices = self._limit_episode_indices(self.episode_indices)
         self.action_dim = int(action_dim) if action_dim is not None else self._infer_action_dim()
         if self.action_encoding == "scalar":
             self.action_dim = 1
@@ -154,11 +163,15 @@ class BabaSamplesNanoWMDataset(Dataset):
         return {
             "video": video,
             "action": action,
+            "wm_loss_weight": torch.tensor(self.wm_loss_weight, dtype=torch.float32),
+            "action_loss_weight": torch.tensor(self.action_loss_weight, dtype=torch.float32),
+            "source": self.source,
             "video_name": video_name,
             "meta_info": {
                 "episode_idx": slice_info.episode_idx,
                 "episode_path": str(episode.path),
                 "start_idx": slice_info.start_frame,
+                "source": self.source,
             },
         }
 
@@ -204,6 +217,21 @@ class BabaSamplesNanoWMDataset(Dataset):
         if self.split == "train":
             return all_indices[:split_at].tolist()
         return all_indices[split_at:].tolist()
+
+    def _limit_episode_indices(self, episode_indices: List[int]) -> List[int]:
+        if self.episode_limit is None:
+            return episode_indices
+        if self.episode_limit < 1:
+            raise ValueError(f"episode_limit must be >= 1, got {self.episode_limit}")
+        if self.episode_limit > len(episode_indices):
+            raise ValueError(
+                f"Requested episode_limit={self.episode_limit} from {self.root}, "
+                f"but only {len(episode_indices)} episodes are available."
+            )
+        rng = np.random.RandomState(self.random_seed)
+        indices = np.asarray(episode_indices)
+        rng.shuffle(indices)
+        return indices[: self.episode_limit].tolist()
 
     def _infer_action_dim(self) -> int:
         if self.action_encoding == "scalar":
@@ -295,6 +323,79 @@ def create_train_val_datasets(
     train = BabaSamplesNanoWMDataset(root, split="train", **kwargs)
     val = BabaSamplesNanoWMDataset(root, split="val", **kwargs)
     return train, val
+
+
+def create_replaced_train_dataset(
+    ppo_root: str | Path,
+    random_root: str | Path,
+    *,
+    random_fraction: float,
+    total_episodes: Optional[int] = None,
+    ppo_action_loss_weight: float = 1.0,
+    random_action_loss_weight: float = 0.0,
+    wm_loss_weight: float = 1.0,
+    **kwargs: Any,
+) -> ConcatDataset:
+    """Create a train dataset where a fraction of PPO episodes is replaced by random episodes."""
+    if not 0.0 <= float(random_fraction) <= 1.0:
+        raise ValueError(f"random_fraction must be in [0, 1], got {random_fraction}")
+
+    ppo_count = count_sample_episodes(ppo_root)
+    random_count = count_sample_episodes(random_root)
+    if total_episodes is None:
+        total_episodes = ppo_count
+    total_episodes = int(total_episodes)
+    if total_episodes < 1:
+        raise ValueError(f"total_episodes must be >= 1, got {total_episodes}")
+
+    random_episodes = int(round(total_episodes * float(random_fraction)))
+    ppo_episodes = total_episodes - random_episodes
+    if ppo_episodes > ppo_count:
+        raise ValueError(f"Need {ppo_episodes} PPO episodes, but {ppo_root} has {ppo_count}.")
+    if random_episodes > random_count:
+        raise ValueError(f"Need {random_episodes} random episodes, but {random_root} has {random_count}.")
+
+    datasets = []
+    if ppo_episodes > 0:
+        datasets.append(
+            BabaSamplesNanoWMDataset(
+                ppo_root,
+                split="all",
+                episode_limit=ppo_episodes,
+                source="ppo",
+                wm_loss_weight=wm_loss_weight,
+                action_loss_weight=ppo_action_loss_weight,
+                **kwargs,
+            )
+        )
+    if random_episodes > 0:
+        datasets.append(
+            BabaSamplesNanoWMDataset(
+                random_root,
+                split="all",
+                episode_limit=random_episodes,
+                source="random",
+                wm_loss_weight=wm_loss_weight,
+                action_loss_weight=random_action_loss_weight,
+                **kwargs,
+            )
+        )
+    if not datasets:
+        raise ValueError("Mixed train dataset is empty.")
+    return ConcatDataset(datasets)
+
+
+def count_sample_episodes(root: str | Path) -> int:
+    root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"Samples root does not exist: {root}")
+    return sum(
+        1
+        for episode_dir in root.iterdir()
+        if episode_dir.is_dir()
+        and (episode_dir / "frames.npy").exists()
+        and (episode_dir / "actions.npy").exists()
+    )
 
 
 def _as_hw(image_size: int | Sequence[int]) -> Tuple[int, int]:

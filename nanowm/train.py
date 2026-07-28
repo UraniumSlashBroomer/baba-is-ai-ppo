@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-from .dataset import BabaSamplesNanoWMDataset, create_train_val_datasets
+from .dataset import BabaSamplesNanoWMDataset, create_replaced_train_dataset, create_train_val_datasets
 from .policy import LatentActionHead
 from .validation import run_env_success_validation
 
@@ -231,10 +231,31 @@ def build_datasets(cfg) -> tuple[BabaSamplesNanoWMDataset, BabaSamplesNanoWMData
     )
     train_root = cfg.data.get("train_samples_root")
     val_root = cfg.data.get("val_samples_root")
+    random_train_root = cfg.data.get("random_train_samples_root")
+    random_fraction = float(cfg.data.get("random_fraction", 0.0) or 0.0)
     if train_root not in (None, "null") or val_root not in (None, "null"):
         if train_root in (None, "null") or val_root in (None, "null"):
             raise ValueError("data.train_samples_root and data.val_samples_root must be set together.")
-        train = BabaSamplesNanoWMDataset(train_root, split="all", **common_kwargs)
+        if random_train_root not in (None, "null") and random_fraction > 0.0:
+            total_episodes = cfg.data.get("mixed_total_episodes")
+            train = create_replaced_train_dataset(
+                train_root,
+                random_train_root,
+                random_fraction=random_fraction,
+                total_episodes=None if total_episodes in (None, "null") else int(total_episodes),
+                ppo_action_loss_weight=float(cfg.data.get("ppo_action_loss_weight", 1.0)),
+                random_action_loss_weight=float(cfg.data.get("random_action_loss_weight", 0.0)),
+                wm_loss_weight=1.0,
+                **common_kwargs,
+            )
+        else:
+            train = BabaSamplesNanoWMDataset(
+                train_root,
+                split="all",
+                source="ppo",
+                action_loss_weight=float(cfg.data.get("ppo_action_loss_weight", 1.0)),
+                **common_kwargs,
+            )
         val = BabaSamplesNanoWMDataset(val_root, split="all", **common_kwargs)
         return train, val
 
@@ -268,6 +289,18 @@ def validate(cfg, loader, model, action_head, latent_codec, diffusion, sample_tr
 def forward_loss(cfg, batch, model, action_head, latent_codec, diffusion, sample_training_timesteps, device: torch.device) -> tuple[torch.Tensor, Dict[str, float]]:
     video = batch["video"].to(device, non_blocking=True)
     action = batch["action"].to(device, non_blocking=True) if bool(cfg.model.use_action) else None
+    wm_loss_weight = batch.get("wm_loss_weight")
+    action_loss_weight = batch.get("action_loss_weight")
+    wm_loss_weight = (
+        wm_loss_weight.to(device, non_blocking=True).float()
+        if wm_loss_weight is not None
+        else torch.ones(video.shape[0], device=device)
+    )
+    action_loss_weight = (
+        action_loss_weight.to(device, non_blocking=True).float()
+        if action_loss_weight is not None
+        else torch.ones(video.shape[0], device=device)
+    )
 
     with torch.no_grad():
         batch_size, num_frames, channels, height, width = video.shape
@@ -278,9 +311,13 @@ def forward_loss(cfg, batch, model, action_head, latent_codec, diffusion, sample
 
     action_logits = action_head(latents[:, 0])
     action_target = action[:, 0].argmax(dim=-1) if action is not None else None
-    action_loss = F.cross_entropy(action_logits, action_target) if action_target is not None else torch.zeros((), device=device)
+    if action_target is not None:
+        per_sample_action_loss = F.cross_entropy(action_logits, action_target, reduction="none")
+        action_loss = weighted_mean(per_sample_action_loss, action_loss_weight)
+    else:
+        action_loss = torch.zeros((), device=device)
     action_acc = (
-        (action_logits.argmax(dim=-1) == action_target).float().mean()
+        weighted_mean((action_logits.argmax(dim=-1) == action_target).float(), action_loss_weight)
         if action_target is not None
         else torch.zeros((), device=device)
     )
@@ -306,7 +343,10 @@ def forward_loss(cfg, batch, model, action_head, latent_codec, diffusion, sample
 
     with autocast_context(cfg, device):
         if str(cfg.train.target_frames) == "all":
-            wm_loss = diffusion.training_losses(model, latents, t, model_kwargs)["loss"].mean()
+            wm_losses = diffusion.training_losses(model, latents, t, model_kwargs)["loss"]
+            if wm_losses.ndim > 1:
+                wm_losses = wm_losses.reshape(wm_losses.shape[0], -1).mean(dim=1)
+            wm_loss = weighted_mean(wm_losses, wm_loss_weight)
         else:
             wm_loss = masked_diffusion_loss(
                 cfg=cfg,
@@ -315,18 +355,27 @@ def forward_loss(cfg, batch, model, action_head, latent_codec, diffusion, sample
                 x_start=latents,
                 t=t,
                 model_kwargs=model_kwargs,
+                sample_weight=wm_loss_weight,
             )
 
     loss = wm_loss + float(cfg.train.action_loss_weight) * action_loss
+    ppo_action_samples = (action_loss_weight > 0).float().sum()
     return loss, {
         "train/loss": float(loss.detach().cpu()),
         "train/wm_loss": float(wm_loss.detach().cpu()),
         "train/action_loss": float(action_loss.detach().cpu()),
         "train/action_acc": float(action_acc.detach().cpu()),
+        "train/action_loss_sample_fraction": float((ppo_action_samples / action_loss_weight.numel()).detach().cpu()),
+        "train/random_sample_fraction": float((action_loss_weight <= 0).float().mean().detach().cpu()),
     }
 
 
-def masked_diffusion_loss(cfg, model, diffusion, x_start, t, model_kwargs) -> torch.Tensor:
+def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(values.device, dtype=values.dtype)
+    return (values * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def masked_diffusion_loss(cfg, model, diffusion, x_start, t, model_kwargs, sample_weight: Optional[torch.Tensor] = None) -> torch.Tensor:
     noise = torch.randn_like(x_start)
     x_t = diffusion.q_sample(x_start, t, noise=noise)
     target = diffusion_target(cfg, diffusion, x_start, t, noise)
@@ -338,7 +387,10 @@ def masked_diffusion_loss(cfg, model, diffusion, x_start, t, model_kwargs) -> to
     frame_mask = target_frame_mask(str(cfg.train.target_frames), per_frame.shape, per_frame.device)
     if hasattr(diffusion, "alphas_cumprod") and float(cfg.diffusion.snr_gamma) > 0:
         per_frame = per_frame * min_snr_weights(diffusion, t, float(cfg.diffusion.snr_gamma), per_frame.shape)
-    return (per_frame * frame_mask).sum() / frame_mask.sum().clamp_min(1.0)
+    weighted_mask = frame_mask
+    if sample_weight is not None:
+        weighted_mask = weighted_mask * sample_weight.to(per_frame.device, dtype=per_frame.dtype)[:, None]
+    return (per_frame * weighted_mask).sum() / weighted_mask.sum().clamp_min(1.0)
 
 
 def diffusion_target(cfg, diffusion, x_start, t, noise):

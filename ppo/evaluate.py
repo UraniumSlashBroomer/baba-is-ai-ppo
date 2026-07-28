@@ -3,7 +3,7 @@ import numpy as np
 import torch
 
 from checkpoints import checkpoint_architecture, load_model_for_checkpoint
-from env import make_env, to_env_action
+from env import make_env, policy_action_count, to_env_action
 from models import detach_state, is_recurrent_model
 from paths import ROOT
 from utils import obs_to_tensor, render_validation_step, set_seed
@@ -69,14 +69,17 @@ def val(cfg, checkpoint, visualize=False, render_fps=0, greedy=None):
 def sample(cfg, checkpoint, visualize=False, greedy=None):
     set_seed(cfg["seed"])
     device = torch.device(cfg["device"])
-    if checkpoint:
+    random_policy = bool(cfg.get("random_policy", False))
+    if checkpoint and not random_policy:
         cfg.update(checkpoint_architecture(checkpoint, device))
     if greedy is None:
         greedy = cfg.get("sample_greedy", False)
     env_cfg = dict(cfg, env_id=cfg.get("sample_env_id", cfg.get("eval_env_id", cfg["env_id"])))
     env = make_env(env_cfg)
-    model = load_model_for_checkpoint(env, cfg, checkpoint, device)
-    model.eval()
+    model = None
+    if not random_policy:
+        model = load_model_for_checkpoint(env, cfg, checkpoint, device)
+        model.eval()
 
     out_dir = ROOT / "samples" / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -93,9 +96,13 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
         obs = env.reset()
         frames, actions, rewards = [env.render(mode="rgb_array")], [], []
         done = False
-        recurrent_state = model.initial_state(1, device) if is_recurrent_model(model) else None
+        recurrent_state = model.initial_state(1, device) if model is not None and is_recurrent_model(model) else None
         while not done:
-            env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state, greedy=greedy)
+            if random_policy:
+                policy_action = int(np.random.randint(policy_action_count(env, cfg)))
+                env_action = to_env_action(policy_action, cfg)
+            else:
+                env_action, recurrent_state = _policy_step(model, obs, cfg, device, recurrent_state, greedy=greedy)
             next_obs, reward, done, _ = env.step(env_action)
 
             actions.append(env_action)

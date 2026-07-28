@@ -13,10 +13,13 @@ def parse_args():
     parser.add_argument("--render-fps", type=float, default=0)
     parser.add_argument("--greedy", action="store_true", help="Use argmax policy actions for val/sample.")
     parser.add_argument("--no-greedy", action="store_true", help="Sample policy actions for val/sample.")
+    parser.add_argument("--random-policy", action="store_true", help="Sample env actions uniformly; only valid with --mode sample.")
     parser.add_argument("--override", default=None)
     args = parser.parse_args()
     if args.greedy and args.no_greedy:
         parser.error("--greedy and --no-greedy are mutually exclusive")
+    if args.random_policy and args.mode != "sample":
+        parser.error("--random-policy is only valid with --mode sample")
     return args
 
 
@@ -25,6 +28,8 @@ def main():
     cfg = load_config(args.config)
     if args.override:
         cfg.update(json.loads(args.override))
+    if args.random_policy:
+        cfg["random_policy"] = True
     policy_greedy = None
     if args.greedy:
         policy_greedy = True
