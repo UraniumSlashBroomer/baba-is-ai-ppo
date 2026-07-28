@@ -1,0 +1,37 @@
+[
+  {
+    "seed": 100000,
+    "success": true,
+    "return": 0.7,
+    "steps": 10,
+    "video": "nanowm/visualizations/step_0010000_5seeds_30steps/seed_100000.mp4"
+  },
+  {
+    "seed": 100001,
+    "success": false,
+    "return": 0.0,
+    "steps": 30,
+    "video": "nanowm/visualizations/step_0010000_5seeds_30steps/seed_100001.mp4"
+  },
+  {
+    "seed": 100002,
+    "success": false,
+    "return": 0.0,
+    "steps": 30,
+    "video": "nanowm/visualizations/step_0010000_5seeds_30steps/seed_100002.mp4"
+  },
+  {
+    "seed": 100003,
+    "success": false,
+    "return": 0.0,
+    "steps": 30,
+    "video": "nanowm/visualizations/step_0010000_5seeds_30steps/seed_100003.mp4"
+  },
+  {
+    "seed": 100004,
+    "success": true,
+    "return": 0.15999999999999992,
+    "steps": 28,
+    "video": "nanowm/visualizations/step_0010000_5seeds_30steps/seed_100004.mp4"
+  }
+]

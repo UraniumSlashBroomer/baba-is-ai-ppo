@@ -80,8 +80,16 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
 
     out_dir = ROOT / "samples" / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
+    seed_start = cfg.get("sample_seed_start")
 
     for ep in range(cfg["sample_episodes"]):
+        episode_seed = None if seed_start is None else int(seed_start) + ep
+        if episode_seed is not None:
+            set_seed(episode_seed)
+            if hasattr(env, "seed"):
+                env.seed(episode_seed)
+            if hasattr(env, "action_space") and hasattr(env.action_space, "seed"):
+                env.action_space.seed(episode_seed)
         obs = env.reset()
         frames, actions, rewards = [env.render(mode="rgb_array")], [], []
         done = False
@@ -99,6 +107,8 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
         episode_dir.mkdir(parents=True, exist_ok=True)
         np.save(episode_dir / "frames.npy", np.asarray(frames, dtype=np.uint8))
         np.save(episode_dir / "actions.npy", np.asarray(actions))
+        if episode_seed is not None:
+            np.save(episode_dir / "seed.npy", np.asarray(episode_seed, dtype=np.int64))
 
         if visualize and frames:
             video_path = out_dir / f"episode_{ep:04d}.mp4"
@@ -108,4 +118,5 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
                 writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             writer.release()
 
-        print(f"sampled episode={ep + 1} return={sum(rewards):.3f} steps={len(actions)}")
+        seed_text = f" seed={episode_seed}" if episode_seed is not None else ""
+        print(f"sampled episode={ep + 1}{seed_text} return={sum(rewards):.3f} steps={len(actions)}")

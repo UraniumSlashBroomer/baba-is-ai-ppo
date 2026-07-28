@@ -3,6 +3,7 @@
 Usage:
     python -m nanowm.train --config nanowm/train_config.yaml
     python -m nanowm.train --config nanowm/train_config.yaml data.samples_root=samples/my_run train.max_steps=1000
+    python -m nanowm.train --config nanowm/train_config.yaml data.train_samples_root=samples/train data.val_samples_root=samples/val
 """
 
 from __future__ import annotations
@@ -215,20 +216,32 @@ def import_nanowm_components():
 
 
 def build_datasets(cfg) -> tuple[BabaSamplesNanoWMDataset, BabaSamplesNanoWMDataset]:
-    return create_train_val_datasets(
-        cfg.data.samples_root,
+    common_kwargs = dict(
         num_frames=int(cfg.model.num_frames),
         frame_interval=int(cfg.dataset.frame_interval),
         image_size=int(cfg.model.image_size),
         action_dim=int(cfg.data.action_dim),
         action_encoding=str(cfg.data.action_encoding),
         action_offset=int(cfg.data.action_offset),
-        split_ratio=float(cfg.data.split_ratio),
         random_seed=int(cfg.seed),
         slice_mode=str(cfg.data.slice_mode),
         stride=int(cfg.data.stride),
         resize_mode=str(cfg.data.resize_mode),
         normalize_pixel=True,
+    )
+    train_root = cfg.data.get("train_samples_root")
+    val_root = cfg.data.get("val_samples_root")
+    if train_root not in (None, "null") or val_root not in (None, "null"):
+        if train_root in (None, "null") or val_root in (None, "null"):
+            raise ValueError("data.train_samples_root and data.val_samples_root must be set together.")
+        train = BabaSamplesNanoWMDataset(train_root, split="all", **common_kwargs)
+        val = BabaSamplesNanoWMDataset(val_root, split="all", **common_kwargs)
+        return train, val
+
+    return create_train_val_datasets(
+        cfg.data.samples_root,
+        split_ratio=float(cfg.data.split_ratio),
+        **common_kwargs,
     )
 
 
@@ -238,12 +251,15 @@ def validate(cfg, loader, model, action_head, latent_codec, diffusion, sample_tr
     action_head.eval()
     metrics_sum: Dict[str, float] = {}
     batches = 0
+    max_batches = int(cfg.validation.get("max_val_batches", 0) or 0)
     for batch in loader:
         _, metrics = forward_loss(cfg, batch, model, action_head, latent_codec, diffusion, sample_training_timesteps, device)
         for key, value in metrics.items():
             val_key = key.replace("train/", "val/")
             metrics_sum[val_key] = metrics_sum.get(val_key, 0.0) + float(value)
         batches += 1
+        if max_batches > 0 and batches >= max_batches:
+            break
     if batches == 0:
         return {"val/loss": math.nan, "val/wm_loss": math.nan, "val/action_loss": math.nan, "val/action_acc": math.nan}
     return {key: value / batches for key, value in metrics_sum.items()}
