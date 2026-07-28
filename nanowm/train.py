@@ -132,7 +132,10 @@ def main() -> None:
                 print(
                     f"step={global_step:07d} train_loss={avg_loss:.6f} "
                     f"wm_loss={metrics['train/wm_loss']:.6f} action_loss={metrics['train/action_loss']:.6f} "
-                    f"action_acc={metrics['train/action_acc']:.3f} elapsed_sec={elapsed:.1f}",
+                    f"action_acc={metrics['train/action_acc']:.3f} "
+                    f"random_frac={metrics['train/random_sample_fraction']:.3f} "
+                    f"action_loss_frac={metrics['train/action_loss_sample_fraction']:.3f} "
+                    f"elapsed_sec={elapsed:.1f}",
                     flush=True,
                 )
                 running_loss = 0.0
