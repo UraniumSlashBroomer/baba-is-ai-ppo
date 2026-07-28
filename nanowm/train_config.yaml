@@ -81,7 +81,7 @@ validation:
   env_id: env/make_win
   max_val_batches: 100
   episodes: 20
-  max_episode_steps: 128
+  max_episode_steps: 64
   use_idle: false
   greedy: true
   sample_next_image: true

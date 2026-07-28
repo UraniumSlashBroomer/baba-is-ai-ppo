@@ -84,6 +84,23 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
     out_dir = ROOT / "samples" / cfg["name"]
     out_dir.mkdir(parents=True, exist_ok=True)
     seed_start = cfg.get("sample_seed_start")
+    truncate_min_steps = cfg.get("random_truncate_min_steps")
+    truncate_max_steps = cfg.get("random_truncate_max_steps")
+    if (truncate_min_steps is not None or truncate_max_steps is not None) and not random_policy:
+        raise ValueError("random_truncate_min_steps/max_steps are only valid with random_policy=true")
+    if random_policy and (truncate_min_steps is not None or truncate_max_steps is not None):
+        if truncate_min_steps is None or truncate_max_steps is None:
+            raise ValueError("random_truncate_min_steps and random_truncate_max_steps must be set together")
+        truncate_min_steps = int(truncate_min_steps)
+        truncate_max_steps = int(truncate_max_steps)
+        if truncate_min_steps < 1 or truncate_max_steps < truncate_min_steps:
+            raise ValueError(
+                "Expected 1 <= random_truncate_min_steps <= random_truncate_max_steps, "
+                f"got {truncate_min_steps}..{truncate_max_steps}"
+            )
+    else:
+        truncate_min_steps = None
+        truncate_max_steps = None
 
     for ep in range(cfg["sample_episodes"]):
         episode_seed = None if seed_start is None else int(seed_start) + ep
@@ -96,8 +113,11 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
         obs = env.reset()
         frames, actions, rewards = [env.render(mode="rgb_array")], [], []
         done = False
+        target_steps = None
+        if truncate_min_steps is not None:
+            target_steps = int(np.random.randint(truncate_min_steps, truncate_max_steps + 1))
         recurrent_state = model.initial_state(1, device) if model is not None and is_recurrent_model(model) else None
-        while not done:
+        while not done and (target_steps is None or len(actions) < target_steps):
             if random_policy:
                 policy_action = int(np.random.randint(policy_action_count(env, cfg)))
                 env_action = to_env_action(policy_action, cfg)
@@ -116,6 +136,8 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
         np.save(episode_dir / "actions.npy", np.asarray(actions))
         if episode_seed is not None:
             np.save(episode_dir / "seed.npy", np.asarray(episode_seed, dtype=np.int64))
+        if target_steps is not None:
+            np.save(episode_dir / "target_steps.npy", np.asarray(target_steps, dtype=np.int64))
 
         if visualize and frames:
             video_path = out_dir / f"episode_{ep:04d}.mp4"
@@ -126,4 +148,5 @@ def sample(cfg, checkpoint, visualize=False, greedy=None):
             writer.release()
 
         seed_text = f" seed={episode_seed}" if episode_seed is not None else ""
-        print(f"sampled episode={ep + 1}{seed_text} return={sum(rewards):.3f} steps={len(actions)}")
+        target_text = f" target_steps={target_steps}" if target_steps is not None else ""
+        print(f"sampled episode={ep + 1}{seed_text}{target_text} return={sum(rewards):.3f} steps={len(actions)}")
