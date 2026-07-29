@@ -55,6 +55,7 @@ class TrainConfig:
     success_threshold: float = 1.0
     seed: int = 42
     video_seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
+    save_videos: bool = True
     wandb_mode: str = "disabled"
 
     def finalize(self) -> None:
@@ -258,6 +259,61 @@ def evaluate(env: Environment, env_params: EnvParams, train_state: TrainState, c
     return {"success_rate": success_rate, "mean_reward": mean_reward, "mean_length": mean_length}
 
 
+def make_evaluate_fn(env: Environment, env_params: EnvParams, config: TrainConfig):
+    eval_init_hstate = jnp.zeros(
+        (1, config.rnn_num_layers, config.rnn_hidden_dim),
+        dtype=jnp.bfloat16 if config.enable_bf16 else None,
+    )
+
+    def _rollout(rng: jax.Array, train_state: TrainState):
+        timestep = env.reset(env_params, rng)
+        prev_action = jnp.asarray(0, dtype=jnp.int32)
+        prev_reward = jnp.asarray(0.0)
+        hstate = eval_init_hstate
+        reward = jnp.asarray(0.0)
+        length = jnp.asarray(0)
+
+        def _cond_fn(carry):
+            timestep, prev_action, prev_reward, hstate, reward, length = carry
+            return jnp.logical_not(timestep.last()) & (length < env_params.max_steps)
+
+        def _body_fn(carry):
+            timestep, prev_action, prev_reward, hstate, reward, length = carry
+            dist, _, hstate = train_state.apply_fn(
+                train_state.params,
+                {
+                    "obs_img": timestep.observation["img"][None, None, ...],
+                    "obs_dir": timestep.observation["direction"][None, None, ...],
+                    "prev_action": prev_action[None, None],
+                    "prev_reward": prev_reward[None, None],
+                },
+                hstate,
+            )
+            action = jnp.argmax(dist.logits).squeeze().astype(jnp.int32)
+            timestep = env.step(env_params, timestep, action)
+            reward = reward + timestep.reward
+            length = length + 1
+            return timestep, action, timestep.reward, hstate, reward, length
+
+        _, _, _, _, reward, length = jax.lax.while_loop(
+            _cond_fn,
+            _body_fn,
+            (timestep, prev_action, prev_reward, hstate, reward, length),
+        )
+        return reward, length, reward > 0.0
+
+    @jax.jit
+    def _evaluate(train_state: TrainState, keys: jax.Array):
+        rewards, lengths, successes = jax.vmap(_rollout, in_axes=(0, None))(keys, train_state)
+        return {
+            "success_rate": successes.mean(),
+            "mean_reward": rewards.mean(),
+            "mean_length": lengths.mean(),
+        }
+
+    return _evaluate
+
+
 def save_checkpoint(run_dir: Path, train_state: TrainState, config: TrainConfig) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "params.msgpack").write_bytes(serialization.to_bytes(train_state.params))
@@ -400,6 +456,8 @@ def train(config: TrainConfig) -> dict:
     env, env_params = make_wrapped_env()
     eval_env, eval_env_params = make_env()
     eval_env = DirectionObservationWrapper(eval_env)
+    evaluate_fn = make_evaluate_fn(eval_env, eval_env_params, config)
+    eval_keys = jax.random.split(jax.random.key(config.seed + 10_000), config.eval_episodes)
     rng, init_hstate, train_state = make_train_state(env, env_params, config)
     train_chunk = make_train_chunk(env, env_params, config)
 
@@ -419,7 +477,8 @@ def train(config: TrainConfig) -> dict:
         completed_updates = min(config.updates_per_eval, config.max_updates - total_updates)
         total_updates += completed_updates
         total_transitions += completed_updates * config.num_steps * config.num_envs
-        final_eval = evaluate(eval_env, eval_env_params, train_state, config)
+        eval_info = jax.block_until_ready(evaluate_fn(train_state, eval_keys))
+        final_eval = jtu.tree_map(lambda x: float(x), eval_info)
         train_metrics = jtu.tree_map(lambda x: float(x[-1]), loss_info)
         row = {
             "updates": total_updates,
@@ -433,7 +492,7 @@ def train(config: TrainConfig) -> dict:
         print(json.dumps(row, sort_keys=True))
         save_checkpoint(run_dir, train_state, config)
 
-    video_stats = generate_videos(run_dir, train_state, config)
+    video_stats = generate_videos(run_dir, train_state, config) if config.save_videos else []
     elapsed = time.time() - started
     summary = {
         "trained": final_eval["success_rate"] >= config.success_threshold,

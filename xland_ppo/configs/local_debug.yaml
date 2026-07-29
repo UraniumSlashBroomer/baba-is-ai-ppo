@@ -28,6 +28,7 @@ eval_episodes: 1
 success_threshold: 1.0
 seed: 42
 video_seeds: [0]
+save_videos: true
 wandb_mode: disabled
 
 hydra:
