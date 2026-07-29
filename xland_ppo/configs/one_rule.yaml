@@ -1,0 +1,35 @@
+mode: train
+run_dir: xland_ppo/runs/one_rule_r1_9x9
+
+total_timesteps: 10000000
+updates_per_eval: 25
+num_envs: 2048
+num_steps: 64
+update_epochs: 1
+num_minibatches: 16
+
+lr: 0.001
+clip_eps: 0.2
+gamma: 0.99
+gae_lambda: 0.95
+ent_coef: 0.01
+vf_coef: 0.5
+max_grad_norm: 0.5
+
+obs_emb_dim: 16
+action_emb_dim: 16
+rnn_hidden_dim: 128
+rnn_num_layers: 1
+head_hidden_dim: 128
+conv_encoder: true
+enable_bf16: false
+
+eval_episodes: 128
+success_threshold: 1.0
+seed: 42
+video_seeds: [0, 1, 2, 3, 4]
+wandb_mode: disabled
+
+hydra:
+  job:
+    chdir: false

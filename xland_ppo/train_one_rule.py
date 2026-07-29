@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+import argparse
+from dataclasses import asdict, dataclass, fields
 from functools import partial
 from pathlib import Path
 
+import hydra
 import imageio.v2 as imageio
 import jax
 import jax.numpy as jnp
@@ -16,6 +17,7 @@ import wandb
 from flax import serialization
 from flax.jax_utils import replicate, unreplicate
 from flax.training.train_state import TrainState
+from omegaconf import DictConfig, OmegaConf
 
 from xminigrid.environment import EnvParams, Environment
 from xminigrid.wrappers import DirectionObservationWrapper, GymAutoResetWrapper
@@ -29,6 +31,7 @@ jax.config.update("jax_threefry_partitionable", True)
 
 @dataclass
 class TrainConfig:
+    mode: str = "train"
     run_dir: str = "xland_ppo/runs/one_rule_r1_9x9"
     total_timesteps: int = 10_000_000
     updates_per_eval: int = 25
@@ -457,57 +460,35 @@ def train(config: TrainConfig) -> dict:
     return summary
 
 
-def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run-dir", default=TrainConfig.run_dir)
-    parser.add_argument("--total-timesteps", type=int, default=TrainConfig.total_timesteps)
-    parser.add_argument("--updates-per-eval", type=int, default=TrainConfig.updates_per_eval)
-    parser.add_argument("--num-envs", type=int, default=TrainConfig.num_envs)
-    parser.add_argument("--num-steps", type=int, default=TrainConfig.num_steps)
-    parser.add_argument("--num-minibatches", type=int, default=TrainConfig.num_minibatches)
-    parser.add_argument("--rnn-hidden-dim", type=int, default=TrainConfig.rnn_hidden_dim)
-    parser.add_argument("--head-hidden-dim", type=int, default=TrainConfig.head_hidden_dim)
-    parser.add_argument("--conv-encoder", action="store_true")
-    parser.add_argument("--eval-episodes", type=int, default=TrainConfig.eval_episodes)
-    parser.add_argument("--seed", type=int, default=TrainConfig.seed)
-    parser.add_argument("--wandb-mode", default=TrainConfig.wandb_mode)
-    parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--local-debug", action="store_true")
-    args = parser.parse_args()
-    config = TrainConfig(
-        run_dir=args.run_dir,
-        total_timesteps=args.total_timesteps,
-        updates_per_eval=args.updates_per_eval,
-        num_envs=args.num_envs,
-        num_steps=args.num_steps,
-        num_minibatches=args.num_minibatches,
-        rnn_hidden_dim=args.rnn_hidden_dim,
-        head_hidden_dim=args.head_hidden_dim,
-        conv_encoder=args.conv_encoder,
-        eval_episodes=args.eval_episodes,
-        seed=args.seed,
-        wandb_mode=args.wandb_mode,
-    )
-    if args.smoke or args.local_debug:
-        config.run_dir = "xland_ppo/runs/smoke_one_rule"
-        config.total_timesteps = 512
-        config.updates_per_eval = 1
-        config.num_envs = 8
-        config.num_steps = 8
-        config.num_minibatches = 2
-        config.rnn_hidden_dim = 16
-        config.head_hidden_dim = 16
-        config.eval_episodes = 2
-    if args.local_debug:
-        config.eval_episodes = 1
-        config.video_seeds = (0,)
-    config.local_debug = args.local_debug
-    return config
+def config_from_hydra(cfg: DictConfig) -> TrainConfig:
+    data = OmegaConf.to_container(cfg, resolve=True)
+    field_names = {field.name for field in fields(TrainConfig)}
+    kwargs = {key: value for key, value in data.items() if key in field_names}
+    if "video_seeds" in kwargs:
+        kwargs["video_seeds"] = tuple(kwargs["video_seeds"])
+    return TrainConfig(**kwargs)
+
+
+@hydra.main(version_base="1.3", config_path="configs", config_name="one_rule")
+def main(cfg: DictConfig) -> None:
+    config = config_from_hydra(cfg)
+    print(OmegaConf.to_yaml(cfg, resolve=True))
+    if config.mode == "local_debug":
+        local_debug(config)
+    elif config.mode == "train":
+        train(config)
+    else:
+        raise ValueError(f"Unknown mode={config.mode!r}; expected 'train' or 'local_debug'.")
 
 
 if __name__ == "__main__":
-    parsed_config = parse_args()
-    if getattr(parsed_config, "local_debug", False):
-        local_debug(parsed_config)
-    else:
-        train(parsed_config)
+    # Hydra 1.3 uses a lazy help object that Python 3.14 argparse rejects.
+    _argparse_check_help = argparse.ArgumentParser._check_help
+
+    def _check_help_compatible(self, action):
+        if not isinstance(action.help, str):
+            return
+        return _argparse_check_help(self, action)
+
+    argparse.ArgumentParser._check_help = _check_help_compatible
+    main()
