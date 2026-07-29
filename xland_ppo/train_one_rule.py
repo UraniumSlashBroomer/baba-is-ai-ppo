@@ -483,12 +483,13 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     # Hydra 1.3 uses a lazy help object that Python 3.14 argparse rejects.
-    _argparse_check_help = argparse.ArgumentParser._check_help
+    if hasattr(argparse.ArgumentParser, "_check_help"):
+        _argparse_check_help = argparse.ArgumentParser._check_help
 
-    def _check_help_compatible(self, action):
-        if not isinstance(action.help, str):
-            return
-        return _argparse_check_help(self, action)
+        def _check_help_compatible(self, action):
+            if not isinstance(action.help, str):
+                return
+            return _argparse_check_help(self, action)
 
-    argparse.ArgumentParser._check_help = _check_help_compatible
+        argparse.ArgumentParser._check_help = _check_help_compatible
     main()
