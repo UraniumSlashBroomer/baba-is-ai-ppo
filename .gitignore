@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Local experiment artifacts
+xland_ppo/runs/
+xland_ppo/videos/*.mp4
+
 # C extensions
 *.so
 
