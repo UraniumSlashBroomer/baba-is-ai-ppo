@@ -4,7 +4,6 @@ import json
 import time
 import argparse
 from dataclasses import asdict, dataclass, fields
-from functools import partial
 from pathlib import Path
 
 import hydra
@@ -15,7 +14,6 @@ import jax.tree_util as jtu
 import optax
 import wandb
 from flax import serialization
-from flax.jax_utils import replicate, unreplicate
 from flax.training.train_state import TrainState
 from omegaconf import DictConfig, OmegaConf
 
@@ -60,12 +58,9 @@ class TrainConfig:
     wandb_mode: str = "disabled"
 
     def finalize(self) -> None:
-        num_devices = jax.local_device_count()
-        if self.num_envs % num_devices != 0:
-            raise ValueError(f"num_envs={self.num_envs} must be divisible by local_device_count={num_devices}")
         if self.num_envs % self.num_minibatches != 0:
             raise ValueError(f"num_envs={self.num_envs} must be divisible by num_minibatches={self.num_minibatches}")
-        self.num_envs_per_device = self.num_envs // num_devices
+        self.num_envs_per_device = self.num_envs
         self.max_updates = self.total_timesteps // (self.num_steps * self.num_envs)
         self.updates_per_eval = min(self.updates_per_eval, max(1, self.max_updates))
         self.max_updates = max(1, (self.max_updates // self.updates_per_eval) * self.updates_per_eval)
@@ -115,7 +110,7 @@ def make_train_state(env: Environment, env_params: EnvParams, config: TrainConfi
 
 
 def make_train_chunk(env: Environment, env_params: EnvParams, config: TrainConfig):
-    @partial(jax.pmap, axis_name="devices")
+    @jax.jit
     def train_chunk(rng: jax.Array, train_state: TrainState, init_hstate: jax.Array):
         rng, reset_rng = jax.random.split(rng)
         reset_rng = jax.random.split(reset_rng, config.num_envs_per_device)
@@ -182,6 +177,7 @@ def make_train_chunk(env: Environment, env_params: EnvParams, config: TrainConfi
                         clip_eps=config.clip_eps,
                         vf_coef=config.vf_coef,
                         ent_coef=config.ent_coef,
+                        axis_name=None,
                     )
 
                 rng, train_state, init_hstate, transitions, advantages, targets = update_state
@@ -405,9 +401,6 @@ def train(config: TrainConfig) -> dict:
     eval_env, eval_env_params = make_env()
     eval_env = DirectionObservationWrapper(eval_env)
     rng, init_hstate, train_state = make_train_state(env, env_params, config)
-    rng = jax.random.split(rng, num=jax.local_device_count())
-    train_state = replicate(train_state, jax.local_devices())
-    init_hstate = replicate(init_hstate, jax.local_devices())
     train_chunk = make_train_chunk(env, env_params, config)
 
     print(f"devices={jax.local_devices()}")
@@ -426,9 +419,8 @@ def train(config: TrainConfig) -> dict:
         completed_updates = min(config.updates_per_eval, config.max_updates - total_updates)
         total_updates += completed_updates
         total_transitions += completed_updates * config.num_steps * config.num_envs
-        host_state = unreplicate(train_state)
-        final_eval = evaluate(eval_env, eval_env_params, host_state, config)
-        train_metrics = jtu.tree_map(lambda x: float(unreplicate(x)[-1]), loss_info)
+        final_eval = evaluate(eval_env, eval_env_params, train_state, config)
+        train_metrics = jtu.tree_map(lambda x: float(x[-1]), loss_info)
         row = {
             "updates": total_updates,
             "transitions": total_transitions,
@@ -439,10 +431,9 @@ def train(config: TrainConfig) -> dict:
             f.write(json.dumps(row, sort_keys=True) + "\n")
         wandb.log(row)
         print(json.dumps(row, sort_keys=True))
-        save_checkpoint(run_dir, host_state, config)
+        save_checkpoint(run_dir, train_state, config)
 
-    host_state = unreplicate(train_state)
-    video_stats = generate_videos(run_dir, host_state, config)
+    video_stats = generate_videos(run_dir, train_state, config)
     elapsed = time.time() - started
     summary = {
         "trained": final_eval["success_rate"] >= config.success_threshold,

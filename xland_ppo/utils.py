@@ -54,6 +54,7 @@ def ppo_update_networks(
     clip_eps: float,
     vf_coef: float,
     ent_coef: float,
+    axis_name: str | None = "devices",
 ):
     # NORMALIZE ADVANTAGES
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -93,7 +94,11 @@ def ppo_update_networks(
         return total_loss, (value_loss, actor_loss, entropy)
 
     (loss, (vloss, aloss, entropy)), grads = jax.value_and_grad(_loss_fn, has_aux=True)(train_state.params)
-    (loss, vloss, aloss, entropy, grads) = jax.lax.pmean((loss, vloss, aloss, entropy, grads), axis_name="devices")
+    if axis_name is not None:
+        loss, vloss, aloss, entropy, grads = jax.lax.pmean(
+            (loss, vloss, aloss, entropy, grads),
+            axis_name=axis_name,
+        )
     train_state = train_state.apply_gradients(grads=grads)
     update_info = {
         "total_loss": loss,
