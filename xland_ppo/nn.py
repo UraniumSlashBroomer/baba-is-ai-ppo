@@ -108,6 +108,7 @@ class ActorCriticRNN(nn.Module):
     rnn_num_layers: int = 1
     head_hidden_dim: int = 64
     img_obs: bool = False
+    conv_encoder: bool = True
     dtype: Optional[Dtype] = None
     param_dtype: Dtype = jnp.float32
 
@@ -160,7 +161,7 @@ class ActorCriticRNN(nn.Module):
                     ),
                 ]
             )
-        else:
+        elif self.conv_encoder:
             img_encoder = nn.Sequential(
                 [
                     # For small dims nn.Embed is extremely slow in bf16, so we leave everything in default dtypes
@@ -187,6 +188,20 @@ class ActorCriticRNN(nn.Module):
                         64,
                         (2, 2),
                         padding="VALID",
+                        kernel_init=orthogonal(math.sqrt(2)),
+                        dtype=self.dtype,
+                        param_dtype=self.param_dtype,
+                    ),
+                    nn.relu,
+                ]
+            )
+        else:
+            img_encoder = nn.Sequential(
+                [
+                    EmbeddingEncoder(emb_dim=self.obs_emb_dim),
+                    lambda x: x.reshape((*x.shape[:-3], -1)),
+                    nn.Dense(
+                        64,
                         kernel_init=orthogonal(math.sqrt(2)),
                         dtype=self.dtype,
                         param_dtype=self.param_dtype,

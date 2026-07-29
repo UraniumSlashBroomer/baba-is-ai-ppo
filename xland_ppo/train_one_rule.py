@@ -48,6 +48,7 @@ class TrainConfig:
     rnn_hidden_dim: int = 128
     rnn_num_layers: int = 1
     head_hidden_dim: int = 128
+    conv_encoder: bool = False
     enable_bf16: bool = False
     eval_episodes: int = 128
     success_threshold: float = 1.0
@@ -91,6 +92,7 @@ def make_train_state(env: Environment, env_params: EnvParams, config: TrainConfi
         rnn_num_layers=config.rnn_num_layers,
         head_hidden_dim=config.head_hidden_dim,
         img_obs=False,
+        conv_encoder=config.conv_encoder,
         dtype=jnp.bfloat16 if config.enable_bf16 else None,
     )
     shapes = env.observation_shape(env_params)
@@ -219,6 +221,7 @@ def deterministic_rollout(env: Environment, env_params: EnvParams, train_state: 
             rnn_num_layers=config.rnn_num_layers,
             head_hidden_dim=config.head_hidden_dim,
             img_obs=False,
+            conv_encoder=config.conv_encoder,
             dtype=jnp.bfloat16 if config.enable_bf16 else None,
         )
         hstate = network.initialize_carry(1)
@@ -464,6 +467,7 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--num-minibatches", type=int, default=TrainConfig.num_minibatches)
     parser.add_argument("--rnn-hidden-dim", type=int, default=TrainConfig.rnn_hidden_dim)
     parser.add_argument("--head-hidden-dim", type=int, default=TrainConfig.head_hidden_dim)
+    parser.add_argument("--conv-encoder", action="store_true")
     parser.add_argument("--eval-episodes", type=int, default=TrainConfig.eval_episodes)
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--wandb-mode", default=TrainConfig.wandb_mode)
@@ -479,6 +483,7 @@ def parse_args() -> TrainConfig:
         num_minibatches=args.num_minibatches,
         rnn_hidden_dim=args.rnn_hidden_dim,
         head_hidden_dim=args.head_hidden_dim,
+        conv_encoder=args.conv_encoder,
         eval_episodes=args.eval_episodes,
         seed=args.seed,
         wandb_mode=args.wandb_mode,
