@@ -4,7 +4,7 @@ checkpoint_path: null
 grid_size: 8
 
 total_timesteps: 10000000
-updates_per_eval: 25
+updates_per_eval: 5
 num_envs: 2048
 num_steps: 64
 update_epochs: 1

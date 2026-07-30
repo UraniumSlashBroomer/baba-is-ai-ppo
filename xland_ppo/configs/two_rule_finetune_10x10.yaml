@@ -4,7 +4,7 @@ checkpoint_path: xland_ppo/runs/two_rule_r1_8x8
 grid_size: 10
 
 total_timesteps: 5000000
-updates_per_eval: 10
+updates_per_eval: 5
 num_envs: 2048
 num_steps: 64
 update_epochs: 1
