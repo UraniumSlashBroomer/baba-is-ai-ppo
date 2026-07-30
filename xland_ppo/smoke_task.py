@@ -13,16 +13,19 @@ from xland_ppo.task import make_env
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--steps", type=int, default=8)
-    parser.add_argument("--out", type=Path, default=Path("xland_ppo/videos/smoke.mp4"))
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--out", type=Path, default=Path("xland_ppo/videos/smoke_two_rule_8x8.mp4"))
     args = parser.parse_args()
 
     env, env_params = make_env()
     key = jax.random.key(args.seed)
-    timestep = env.reset(env_params, key)
+    key, reset_key = jax.random.split(key)
+    timestep = env.reset(env_params, reset_key)
 
     frames = [env.render(env_params, timestep)]
-    for action in [1, 0, 2, 0, 1, 0, 0, 0][: args.steps]:
+    for _ in range(args.steps):
+        key, action_key = jax.random.split(key)
+        action = jax.random.randint(action_key, shape=(), minval=0, maxval=env.num_actions(env_params))
         timestep = env.step(env_params, timestep, jnp.asarray(action))
         frames.append(env.render(env_params, timestep))
         if bool(timestep.last()):
@@ -33,6 +36,7 @@ def main() -> None:
     print(f"env={type(env).__name__}")
     print(f"obs_shape={env.observation_shape(env_params)}")
     print(f"num_actions={env.num_actions(env_params)}")
+    print(f"height={env_params.height} width={env_params.width} max_steps={env_params.max_steps}")
     print(f"ruleset={env_params.ruleset}")
     print(f"wrote={args.out}")
 

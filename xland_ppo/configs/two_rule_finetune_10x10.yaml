@@ -1,16 +1,16 @@
 mode: train
-run_dir: xland_ppo/runs/two_rule_r1_8x8
-checkpoint_path: null
-grid_size: 8
+run_dir: xland_ppo/runs/two_rule_r1_10x10_finetune
+checkpoint_path: xland_ppo/runs/two_rule_r1_8x8
+grid_size: 10
 
-total_timesteps: 10000000
-updates_per_eval: 25
+total_timesteps: 5000000
+updates_per_eval: 10
 num_envs: 2048
 num_steps: 64
 update_epochs: 1
 num_minibatches: 16
 
-lr: 0.001
+lr: 0.0003
 clip_eps: 0.2
 gamma: 0.99
 gae_lambda: 0.95
@@ -29,7 +29,7 @@ enable_bf16: false
 eval_episodes: 128
 success_threshold: 1.0
 required_success_evals: 5
-seed: 42
+seed: 43
 video_seeds: [0, 1, 2, 3, 4]
 save_videos: true
 wandb_mode: disabled

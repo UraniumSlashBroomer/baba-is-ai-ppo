@@ -1,5 +1,7 @@
 mode: local_debug
-run_dir: xland_ppo/runs/smoke_one_rule
+run_dir: xland_ppo/runs/smoke_two_rule
+checkpoint_path: null
+grid_size: 8
 
 total_timesteps: 512
 updates_per_eval: 1
@@ -26,6 +28,7 @@ enable_bf16: false
 
 eval_episodes: 1
 success_threshold: 1.0
+required_success_evals: 1
 seed: 42
 video_seeds: [0]
 save_videos: true

@@ -30,7 +30,9 @@ jax.config.update("jax_threefry_partitionable", True)
 @dataclass
 class TrainConfig:
     mode: str = "train"
-    run_dir: str = "xland_ppo/runs/one_rule_r1_9x9"
+    run_dir: str = "xland_ppo/runs/two_rule_r1_8x8"
+    checkpoint_path: str | None = None
+    grid_size: int = 8
     total_timesteps: int = 10_000_000
     updates_per_eval: int = 25
     num_envs: int = 2048
@@ -49,10 +51,11 @@ class TrainConfig:
     rnn_hidden_dim: int = 128
     rnn_num_layers: int = 1
     head_hidden_dim: int = 128
-    conv_encoder: bool = False
+    conv_encoder: bool = True
     enable_bf16: bool = False
     eval_episodes: int = 128
     success_threshold: float = 1.0
+    required_success_evals: int = 5
     seed: int = 42
     video_seeds: tuple[int, ...] = (0, 1, 2, 3, 4)
     save_videos: bool = True
@@ -68,8 +71,8 @@ class TrainConfig:
         self.effective_total_timesteps = self.max_updates * self.num_steps * self.num_envs
 
 
-def make_wrapped_env():
-    env, env_params = make_env()
+def make_wrapped_env(config: TrainConfig):
+    env, env_params = make_env(grid_size=config.grid_size)
     env = GymAutoResetWrapper(env)
     env = DirectionObservationWrapper(env)
     return env, env_params
@@ -108,6 +111,17 @@ def make_train_state(env: Environment, env_params: EnvParams, config: TrainConfi
         optax.inject_hyperparams(optax.adam)(learning_rate=linear_schedule, eps=1e-8),
     )
     return rng, init_hstate, TrainState.create(apply_fn=network.apply, params=params, tx=tx)
+
+
+def load_checkpoint_params(train_state: TrainState, checkpoint_path: str | None) -> TrainState:
+    if checkpoint_path is None:
+        return train_state
+
+    path = Path(checkpoint_path)
+    if path.is_dir():
+        path = path / "params.msgpack"
+    params = serialization.from_bytes(train_state.params, path.read_bytes())
+    return train_state.replace(params=params)
 
 
 def make_train_chunk(env: Environment, env_params: EnvParams, config: TrainConfig):
@@ -321,7 +335,7 @@ def save_checkpoint(run_dir: Path, train_state: TrainState, config: TrainConfig)
 
 
 def generate_videos(run_dir: Path, train_state: TrainState, config: TrainConfig, max_steps: int | None = None) -> list[dict]:
-    env, env_params = make_env(max_steps=max_steps)
+    env, env_params = make_env(max_steps=max_steps, grid_size=config.grid_size)
     env = DirectionObservationWrapper(env)
     video_dir = run_dir / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -339,8 +353,9 @@ def local_debug(config: TrainConfig) -> dict:
     config.finalize()
     print("local_debug: init", flush=True)
     run_dir = Path(config.run_dir)
-    env, env_params = make_wrapped_env()
+    env, env_params = make_wrapped_env(config)
     rng, init_hstate, train_state = make_train_state(env, env_params, config)
+    train_state = load_checkpoint_params(train_state, config.checkpoint_path)
     print("local_debug: state ready", flush=True)
 
     rng, reset_rng = jax.random.split(rng)
@@ -427,7 +442,7 @@ def local_debug(config: TrainConfig) -> dict:
     train_state = train_state.apply_gradients(grads=grads)
     print("local_debug: update ready", flush=True)
     save_checkpoint(run_dir, train_state, config)
-    eval_env, eval_env_params = make_env(max_steps=16)
+    eval_env, eval_env_params = make_env(max_steps=16, grid_size=config.grid_size)
     eval_env = DirectionObservationWrapper(eval_env)
     eval_stats = evaluate(eval_env, eval_env_params, train_state, config)
     print("local_debug: eval ready", flush=True)
@@ -452,13 +467,14 @@ def train(config: TrainConfig) -> dict:
     if metrics_path.exists():
         metrics_path.unlink()
 
-    wandb.init(project="xminigrid", group="one-rule", name=run_dir.name, config=asdict(config), mode=config.wandb_mode)
-    env, env_params = make_wrapped_env()
-    eval_env, eval_env_params = make_env()
+    wandb.init(project="xminigrid", group="two-rule", name=run_dir.name, config=asdict(config), mode=config.wandb_mode)
+    env, env_params = make_wrapped_env(config)
+    eval_env, eval_env_params = make_env(grid_size=config.grid_size)
     eval_env = DirectionObservationWrapper(eval_env)
     evaluate_fn = make_evaluate_fn(eval_env, eval_env_params, config)
     eval_keys = jax.random.split(jax.random.key(config.seed + 10_000), config.eval_episodes)
     rng, init_hstate, train_state = make_train_state(env, env_params, config)
+    train_state = load_checkpoint_params(train_state, config.checkpoint_path)
     train_chunk = make_train_chunk(env, env_params, config)
 
     print(f"devices={jax.local_devices()}")
@@ -472,17 +488,21 @@ def train(config: TrainConfig) -> dict:
     total_transitions = 0
     started = time.time()
     final_eval = {"success_rate": 0.0, "mean_reward": 0.0, "mean_length": 0.0}
-    while total_updates < config.max_updates and final_eval["success_rate"] < config.success_threshold:
+    success_eval_count = 0
+    while total_updates < config.max_updates and success_eval_count < config.required_success_evals:
         rng, train_state, loss_info = jax.block_until_ready(compiled(rng, train_state, init_hstate))
         completed_updates = min(config.updates_per_eval, config.max_updates - total_updates)
         total_updates += completed_updates
         total_transitions += completed_updates * config.num_steps * config.num_envs
         eval_info = jax.block_until_ready(evaluate_fn(train_state, eval_keys))
         final_eval = jtu.tree_map(lambda x: float(x), eval_info)
+        if final_eval["success_rate"] >= config.success_threshold:
+            success_eval_count += 1
         train_metrics = jtu.tree_map(lambda x: float(x[-1]), loss_info)
         row = {
             "updates": total_updates,
             "transitions": total_transitions,
+            "success_eval_count": success_eval_count,
             **train_metrics,
             **{f"eval/{k}": v for k, v in final_eval.items()},
         }
@@ -495,10 +515,11 @@ def train(config: TrainConfig) -> dict:
     video_stats = generate_videos(run_dir, train_state, config) if config.save_videos else []
     elapsed = time.time() - started
     summary = {
-        "trained": final_eval["success_rate"] >= config.success_threshold,
+        "trained": success_eval_count >= config.required_success_evals,
         "elapsed_seconds": elapsed,
         "updates": total_updates,
         "transitions": total_transitions,
+        "success_eval_count": success_eval_count,
         "eval": final_eval,
         "videos": video_stats,
         "env_id": ENV_ID,
@@ -519,7 +540,7 @@ def config_from_hydra(cfg: DictConfig) -> TrainConfig:
     return TrainConfig(**kwargs)
 
 
-@hydra.main(version_base="1.3", config_path="configs", config_name="one_rule")
+@hydra.main(version_base="1.3", config_path="configs", config_name="two_rule_8x8")
 def main(cfg: DictConfig) -> None:
     config = config_from_hydra(cfg)
     print(OmegaConf.to_yaml(cfg, resolve=True))

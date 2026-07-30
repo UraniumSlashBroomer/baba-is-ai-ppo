@@ -90,6 +90,19 @@ class EmbeddingEncoder(nn.Module):
             ],
             axis=-1,
         )
+        if img.shape[-1] > 2:
+            extra = img[..., 2:].astype(img_emb.dtype)
+            if img.shape[-1] >= 5:
+                extra = jnp.concatenate(
+                    [
+                        extra[..., 0:1],
+                        extra[..., 1:2] / float(NUM_TILES - 1),
+                        extra[..., 2:3] / float(NUM_COLORS - 1),
+                        extra[..., 3:],
+                    ],
+                    axis=-1,
+                )
+            img_emb = jnp.concatenate([img_emb, extra], axis=-1)
         return img_emb
 
 
@@ -193,6 +206,7 @@ class ActorCriticRNN(nn.Module):
                         param_dtype=self.param_dtype,
                     ),
                     nn.relu,
+                    lambda x: x.mean(axis=(-3, -2)),
                 ]
             )
         else:
